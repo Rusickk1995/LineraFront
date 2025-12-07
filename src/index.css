@@ -1,0 +1,89 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  @keyframes card-deal {
+    0% {
+      transform: translateY(-100px) scale(0.5) rotate(-10deg);
+      opacity: 0;
+    }
+    100% {
+      transform: translateY(0) scale(1) rotate(0);
+      opacity: 1;
+    }
+  }
+
+  @keyframes chip-grow {
+    0% {
+      transform: scale(0);
+      opacity: 0;
+    }
+    50% {
+      transform: scale(1.2);
+    }
+    100% {
+      transform: scale(1);
+      opacity: 1;
+    }
+  }
+
+  @keyframes pulse-glow {
+    0%, 100% {
+      box-shadow: 0 0 20px rgba(229, 0, 0, 0.5);
+    }
+    50% {
+      box-shadow: 0 0 40px rgba(229, 0, 0, 0.8);
+    }
+  }
+
+  .animate-card-deal {
+    animation: card-deal 0.5s ease-out forwards;
+  }
+
+  .animate-chip-grow {
+    animation: chip-grow 0.6s ease-out forwards;
+  }
+
+  .animate-pulse-glow {
+    animation: pulse-glow 2s ease-in-out infinite;
+  }
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: #000;
+  color: #fff;
+}
+
+/* ==== 🔥 canvas с туннелем на фоне ==== */
+#doom-tunnel {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  display: block;
+  pointer-events: none; /* чтобы не мешал кликам по UI */
+}
+
+/* React-приложение поверх */
+#root {
+  position: relative;
+  z-index: 1;
+}
