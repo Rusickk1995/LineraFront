@@ -3,7 +3,6 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -11,17 +10,15 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json"
   },
-
   "dependencies": {
     "@linera/client": "0.15.6",
-    "@linera/wallet-sdk": "github:Rusickk1995/linera-wallet",
+    "@linera/wallet-sdk": "github:Rusickk1995/linera-wallet#main",
     "@supabase/supabase-js": "^2.57.4",
     "lucide-react": "^0.344.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^7.9.6"
   },
-
   "devDependencies": {
     "@eslint/js": "^9.9.1",
     "@types/react": "^18.3.5",
@@ -38,7 +35,6 @@
     "typescript-eslint": "^8.3.0",
     "vite": "^5.4.2"
   },
-
   "pnpm": {
     "overrides": {
       "@linera/client": "0.15.6"

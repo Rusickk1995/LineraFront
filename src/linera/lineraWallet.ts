@@ -5,9 +5,9 @@ import { LINERA_APP_ID } from "./lineraEnv";
 
 import {
   initWallet,
+  getLineraClient,
   type WalletInitResult,
-} from "@linera/wallet-sdk/src/api/wallet-api";
-import { getLineraClient } from "@linera/wallet-sdk/src/network/linera-client";
+} from "@linera/wallet-sdk";
 
 export type BackendContext = {
   client: Client;
