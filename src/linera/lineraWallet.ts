@@ -2,11 +2,11 @@
 //
 // Адаптер между @linera/wallet-sdk и твоим Poker-приложением:
 //  - поднятие Linera Client (getLineraClient)
-//  - создание Application по LINERA_APP_ID
+//  - создание Application по LINERA_APP_ID и LINERA_CHAIN_ID
 //  - единый BackendContext + кеш в window.*.
 
 import type { Application, Client } from "@linera/client";
-import { LINERA_APP_ID } from "./lineraEnv";
+import { LINERA_APP_ID, LINERA_CHAIN_ID } from "./lineraEnv";
 
 import { getLineraClient } from "@linera/wallet-sdk";
 
@@ -43,10 +43,17 @@ type DirectApplicationClient = Client & {
   application(id: string): Application | Promise<Application>;
 };
 
+type ChainClient = {
+  application(id: string): Application | Promise<Application>;
+};
+
+type ClientWithChain = Client & {
+  chain(id: string): ChainClient;
+};
+
 type ApplicationWithQuery = Application & {
   query(body: string): string | Promise<string>;
 };
-
 
 function hasFrontend(client: Client): client is Client & FrontendLike {
   const candidate = client as unknown as { frontend?: unknown };
@@ -56,6 +63,11 @@ function hasFrontend(client: Client): client is Client & FrontendLike {
 function hasDirectApplication(client: Client): client is DirectApplicationClient {
   const candidate = client as unknown as { application?: unknown };
   return typeof candidate.application === "function";
+}
+
+function hasChain(client: Client): client is ClientWithChain {
+  const candidate = client as unknown as { chain?: unknown };
+  return typeof candidate.chain === "function";
 }
 
 function hasApplicationQuery(app: Application): app is ApplicationWithQuery {
@@ -150,12 +162,24 @@ async function createBackend(): Promise<BackendContext> {
 
     log("getLineraClient returned control");
 
-    // 2) Application по APP_ID. Поддерживаем оба варианта API:
-    //    - client.frontend().application(APP_ID)
-    //    - client.application(APP_ID)
+    // 2) Application по APP_ID/CHAIN_ID.
+    //    В ПЕРВУЮ ОЧЕРЕДЬ пробуем явный client.chain(CHAIN_ID).application(APP_ID),
+    //    чтобы не зависеть от default-chain.
     let application: Application;
 
-    if (hasFrontend(client)) {
+    if (hasChain(client)) {
+      log(
+        "Creating Application via client.chain().application for APP_ID =",
+        LINERA_APP_ID,
+        "CHAIN_ID =",
+        LINERA_CHAIN_ID
+      );
+      const chainClient = client.chain(LINERA_CHAIN_ID);
+      const maybeApplication = chainClient.application(LINERA_APP_ID);
+      application = isPromiseLike<Application>(maybeApplication)
+        ? await maybeApplication
+        : maybeApplication;
+    } else if (hasFrontend(client)) {
       log(
         "Creating Application via client.frontend().application for APP_ID =",
         LINERA_APP_ID
@@ -175,7 +199,8 @@ async function createBackend(): Promise<BackendContext> {
         : maybeApplication;
     } else {
       throw new Error(
-        "[lineraWallet] Neither client.frontend().application nor client.application is available on Client"
+        "[lineraWallet] No supported method to obtain Application from Client " +
+          "(no chain(), no frontend(), no application())."
       );
     }
 
