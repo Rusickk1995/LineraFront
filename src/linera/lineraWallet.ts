@@ -10,10 +10,16 @@ import { LINERA_APP_ID } from "./lineraEnv";
 
 import { getLineraClient } from "@linera/wallet-sdk";
 
+// ----------------------------------------------------------------------------
+// Типы backend-контекста
+// ----------------------------------------------------------------------------
+
 export type BackendContext = {
   client: Client;
   application: Application;
   appId: string;
+  // Транспорт GraphQL: принимает JSON-строку, возвращает JSON-строку.
+  query(body: string): Promise<string>;
 };
 
 let backendPromise: Promise<BackendContext> | null = null;
@@ -37,6 +43,11 @@ type DirectApplicationClient = Client & {
   application(id: string): Application | Promise<Application>;
 };
 
+type ApplicationWithQuery = Application & {
+  query(body: string): string | Promise<string>;
+};
+
+
 function hasFrontend(client: Client): client is Client & FrontendLike {
   const candidate = client as unknown as { frontend?: unknown };
   return typeof candidate.frontend === "function";
@@ -45,6 +56,11 @@ function hasFrontend(client: Client): client is Client & FrontendLike {
 function hasDirectApplication(client: Client): client is DirectApplicationClient {
   const candidate = client as unknown as { application?: unknown };
   return typeof candidate.application === "function";
+}
+
+function hasApplicationQuery(app: Application): app is ApplicationWithQuery {
+  const candidate = app as unknown as { query?: unknown };
+  return typeof candidate.query === "function";
 }
 
 function isPromiseLike<T>(value: unknown): value is Promise<T> {
@@ -56,7 +72,10 @@ function isPromiseLike<T>(value: unknown): value is Promise<T> {
   return typeof maybeThen === "function";
 }
 
-// Расширяем Window для отладочных хэндлов, чтобы не использовать any.
+// ----------------------------------------------------------------------------
+// Расширенный window для отладки
+// ----------------------------------------------------------------------------
+
 interface LineraDebugWindow extends Window {
   LINERA_BACKEND?: BackendContext;
   LINERA_BACKEND_ERROR?: unknown;
@@ -69,7 +88,10 @@ function getDebugWindow(): LineraDebugWindow | null {
   return window as LineraDebugWindow;
 }
 
-// Небольшой helper, чтобы не висеть бесконечно в случае зависания промиса.
+// ----------------------------------------------------------------------------
+// Helper withTimeout
+// ----------------------------------------------------------------------------
+
 async function withTimeout<T>(
   promise: Promise<T>,
   label: string,
@@ -99,6 +121,10 @@ async function withTimeout<T>(
     throw e;
   }
 }
+
+// ----------------------------------------------------------------------------
+// Создание backend-контекста
+// ----------------------------------------------------------------------------
 
 async function createBackend(): Promise<BackendContext> {
   log("Initializing Linera wallet backend…");
@@ -153,10 +179,23 @@ async function createBackend(): Promise<BackendContext> {
       );
     }
 
+    // 3) Строим функцию query(body: string) поверх application.query(body).
+    if (!hasApplicationQuery(application)) {
+      throw new Error(
+        "[lineraWallet] Application object does not expose query(body: string) method required for GraphQL transport"
+      );
+    }
+
+    const query = async (body: string): Promise<string> => {
+      const result = application.query(body);
+      return isPromiseLike<string>(result) ? await result : result;
+    };
+
     const backend: BackendContext = {
       client,
       application,
       appId: LINERA_APP_ID,
+      query,
     };
 
     const debugWindow = getDebugWindow();
@@ -178,10 +217,14 @@ async function createBackend(): Promise<BackendContext> {
       debugWindow.LINERA_BACKEND_ERROR = e;
     }
 
-    // createBackend кидает ошибку, а сброс backendPromise делается в getBackend().
+    // Сброс делаем в getBackend(), чтобы можно было повторить попытку.
     throw e;
   }
 }
+
+// ----------------------------------------------------------------------------
+// Публичный API
+// ----------------------------------------------------------------------------
 
 export async function getBackend(): Promise<BackendContext> {
   if (!backendPromise) {
