@@ -7,6 +7,7 @@ const FAUCET_URL =
 
 const APP_ID = import.meta.env.VITE_LINERA_APP_ID as string | undefined;
 
+/** Минимальный контракт backend, который нам нужен */
 export type Backend = {
   query(request: string): Promise<string>;
 };
@@ -26,16 +27,36 @@ function parseJson(raw: string): unknown {
   }
 }
 
+/**
+ * В @linera/client@0.15.7 для Web/WASM инициализация делается через initialize().
+ * default() не существует (ты это уже подтвердил через Object.keys()).
+ */
+let wasmInitPromise: Promise<void> | null = null;
+async function ensureLineraInitialized(): Promise<void> {
+  if (!wasmInitPromise) {
+    wasmInitPromise = (async () => {
+      // initialize есть в exports у 0.15.7
+      await linera.initialize();
+    })();
+  }
+  await wasmInitPromise;
+}
+
 let clientPromise: Promise<linera.Client> | null = null;
 let backendPromise: Promise<Backend> | null = null;
 
 async function getClient(): Promise<linera.Client> {
   if (!clientPromise) {
     clientPromise = (async () => {
-      await linera.default();
+      await ensureLineraInitialized();
 
       const faucet = new linera.Faucet(FAUCET_URL);
+
+      // В 0.15.7 createWallet() возвращает Wallet (под капотом может быть InMemoryWallet).
       const wallet = await faucet.createWallet();
+
+      // Важно: если конструктор Client требует signer/flags, TypeScript тебе покажет.
+      // Ты уже видел, что ts ругался когда типы не сходились, но сейчас у тебя всё компилируется.
       const client = new linera.Client(wallet);
 
       const chainId = await faucet.claimChain(client);
@@ -50,14 +71,21 @@ async function getClient(): Promise<linera.Client> {
 export async function getBackend(): Promise<Backend> {
   if (!backendPromise) {
     backendPromise = (async () => {
-      if (!APP_ID) throw new Error("VITE_LINERA_APP_ID is missing (.env.local).");
+      if (!APP_ID) {
+        throw new Error("VITE_LINERA_APP_ID is missing (.env.local).");
+      }
+
       const client = await getClient();
+
+      // Если в 0.15.7 метод называется иначе (например, client.application(APP_ID)),
+      // эта строка упадёт сразу и мы поправим под фактический API.
       const backend = await client.frontend().application(APP_ID);
 
       const maybe = backend as unknown;
       if (!isRecord(maybe) || typeof maybe.query !== "function") {
         throw new Error("Backend does not expose query(request: string): Promise<string>");
       }
+
       return maybe as Backend;
     })();
   }
@@ -90,6 +118,10 @@ export async function gql<TData>(
   return data;
 }
 
+/**
+ * Introspection: чтобы навсегда закрыть тему snake/camel naming.
+ * Вызовешь — получишь реальные названия Query/Mutation полей из сервиса.
+ */
 export async function listGraphQLOperations(): Promise<{
   queries: string[];
   mutations: string[];
@@ -115,4 +147,3 @@ export async function listGraphQLOperations(): Promise<{
     mutations: (data.__schema.mutationType?.fields ?? []).map((f) => f.name),
   };
 }
-export * from "./pokerApi";
