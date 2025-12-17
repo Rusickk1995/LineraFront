@@ -1,1171 +1,671 @@
 // src/linera/pokerApi.ts
-//
-// Poker GraphQL API поверх Linera Application.
-// Здесь:
-//  - GraphQL-транспорт (callServiceGraphQL)
-//  - внутренние GQL-типы
-//  - маппинги GQL -> OnChain DTO
-//  - READ-операции (fetch*)
-//  - МУТАЦИИ (create/start/advance/close, playerAction и т.д.)
-
-import type {
-  OnChainCard,
-  OnChainPlayerAtTableDto,
-  OnChainTableViewDto,
-  OnChainTournamentViewDto,
-} from "../types/onchain";
-import type {
-  AnteType,
-  BlindLevel,
-  TournamentConfig,
-} from "../types/poker";
-import { getBackend } from "./lineraWallet";
-
-// ============================================================================
-//      GraphQL-обёртка через backend.query(JSON.stringify({ query, variables }))
-// ============================================================================
-
-interface GraphQLResponse<TData> {
-  data?: TData;
-  errors?: { message: string }[];
-}
-
-/** Минимальный интерфейс backend'a, который нам нужен для GraphQL. */
-interface BackendWithQuery {
-  query(body: string): Promise<string>;
-}
+import { gql } from "./lineraClient";
 
 /**
- * Главная точка входа: отправка GraphQL-запроса в твой Poker service
- * через Linera Web client (без локального HTTP GraphQL).
+ * У тебя GraphQL построен на async-graphql. В зависимости от настроек,
+ * имена полей/аргументов могут быть либо snake_case (как в Rust),
+ * либо camelCase. Поэтому для надёжности делаем fallback.
  */
-async function callServiceGraphQL<TData>(
-  query: string,
-  variables?: Record<string, unknown>
-): Promise<TData> {
-  const backend = (await getBackend()) as unknown as BackendWithQuery;
 
-  const payload = { query, variables };
-
-  let raw: string;
-  try {
-    raw = await backend.query(JSON.stringify(payload));
-  } catch (e) {
-    console.error("[callServiceGraphQL] backend.query threw:", e);
-    throw e;
-  }
-
-  let parsed: GraphQLResponse<TData>;
-  try {
-    parsed = JSON.parse(raw) as GraphQLResponse<TData>;
-  } catch {
-    console.error("[callServiceGraphQL] Failed to parse response", raw);
-    throw new Error("Invalid JSON from backend.query()");
-  }
-
-  if (parsed.errors && parsed.errors.length > 0) {
-    const msg = parsed.errors.map((er) => er.message).join("; ");
-    console.error("[callServiceGraphQL] GraphQL errors", parsed.errors);
-    throw new Error(`Linera GraphQL error: ${msg}`);
-  }
-
-  if (!parsed.data) {
-    throw new Error("Linera GraphQL error: missing `data` in response");
-  }
-
-  return parsed.data;
+function shouldRetryWithFallback(message: string): boolean {
+  return (
+    message.includes("Cannot query field") ||
+    message.includes("Unknown argument") ||
+    message.includes("Unknown type") ||
+    message.includes("Unknown field") ||
+    message.includes("Did you mean")
+  );
 }
 
-// ============================================================================
-//              ВНУТРЕННИЕ GQL-типы (как в service.rs / GraphQL)
-// ============================================================================
+async function gqlWithFallback<TData>(
+  primary: string,
+  fallback: string,
+  variables?: Record<string, unknown>,
+  operationName?: string
+): Promise<TData> {
+  try {
+    return await gql<TData>(primary, variables, operationName);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!fallback || !shouldRetryWithFallback(msg)) throw e;
+    return await gql<TData>(fallback, variables, operationName);
+  }
+}
 
-type GqlAnteType = "None" | "Classic" | "BigBlind";
+// -----------------------------------------------------------------------------
+// Types matching service.rs GraphQL objects (Gql*)
+// -----------------------------------------------------------------------------
 
-type GqlPlayerActionKind =
-  | "Fold"
-  | "Check"
-  | "Call"
-  | "Bet"
-  | "Raise"
-  | "AllIn";
+export type TableId = string;
+export type TournamentId = number;
 
-interface GqlCard {
+export type GqlCard = {
   rank: string;
   suit: string;
-}
+};
 
-interface GqlPlayerAtTable {
-  playerId: number;
-  displayName: string;
-  seatIndex: number;
+export type GqlPlayerAtTable = {
+  player_id: number;
+  display_name: string;
+  seat_index: number;
   stack: number;
-  currentBet: number;
+  current_bet: number;
   status: string;
-  holeCards?: GqlCard[] | null;
-}
+  hole_cards: GqlCard[] | null;
+};
 
-// ВАЖНО: в service.rs GqlTableView.table_id: String,
-// значит здесь `tableId: string`, а не number.
-interface GqlTableView {
-  tableId: string;
+export type GqlTableView = {
+  table_id: string;
   name: string;
-  maxSeats: number;
-  smallBlind: number;
-  bigBlind: number;
+  max_seats: number;
+  small_blind: number;
+  big_blind: number;
   ante: number;
   street: string;
-  dealerButton?: number | null;
-  totalPot: number;
+  dealer_button: number | null;
+  total_pot: number;
   board: GqlCard[];
   players: GqlPlayerAtTable[];
-  handInProgress: boolean;
-  currentActorSeat?: number | null;
-}
+  hand_in_progress: boolean;
+  current_actor_seat: number | null;
+};
 
-interface GqlTournamentView {
-  tournamentId: number;
+export type GqlTournamentView = {
+  tournament_id: number;
   name: string;
   status: string;
-  currentLevel: number;
-  playersRegistered: number;
-  tablesRunning: number;
-}
+  current_level: number;
+  players_registered: number;
+  tables_running: number;
+};
 
-interface GqlSummary {
-  totalHandsPlayed: number;
-  tablesCount: number;
-  tournamentsCount: number;
-}
-
-export interface SummaryResponse {
+export type SummaryGql = {
   total_hands_played: number;
   tables_count: number;
   tournaments_count: number;
-}
+};
 
-export interface MutationAck {
+export type MutationAck = {
   ok: boolean;
   message: string;
+};
+
+// Enums exactly as in service.rs
+export enum AnteType {
+  None = "None",
+  Classic = "Classic",
+  BigBlind = "BigBlind",
 }
 
-// ============================================================================
-//                  Хелперы для ACK (MutationAck)
-// ============================================================================
-
-/** Внутренний вид ACK от бэкенда (любой вариант). */
-interface RawAckShape {
-  ok?: unknown;
-  success?: unknown;
-  message?: unknown;
-  error?: unknown;
+export enum PlayerActionKind {
+  Fold = "Fold",
+  Check = "Check",
+  Call = "Call",
+  Bet = "Bet",
+  Raise = "Raise",
+  AllIn = "AllIn",
 }
 
-/**
- * Нормализация произвольного ответа бэкенда к MutationAck.
- * Поддерживает:
- *  - { ok: bool, message?: string }
- *  - { success: bool, error?: string }
- *  - любые truthy / falsy значения в raw.ok.
- */
-function normalizeAck(raw: unknown, context: string): MutationAck {
-  if (raw === null || typeof raw !== "object") {
-    console.error(`[pokerApi] ${context} raw non-object ack:`, raw);
-    return {
-      ok: true,
-      message: `${context}: backend returned non-object ack`,
-    };
-  }
+// -----------------------------------------------------------------------------
+// Queries
+// -----------------------------------------------------------------------------
 
-  const obj = raw as RawAckShape;
-
-  let ok: boolean;
-
-  if (typeof obj.ok === "boolean") {
-    ok = obj.ok;
-  } else if (typeof obj.success === "boolean") {
-    ok = obj.success;
-  } else if (obj.ok != null) {
-    ok = Boolean(obj.ok);
-  } else if (obj.success != null) {
-    ok = Boolean(obj.success);
-  } else {
-    ok = true;
-  }
-
-  let message = "";
-  if (typeof obj.message === "string") {
-    message = obj.message;
-  } else if (typeof obj.error === "string") {
-    message = obj.error;
-  }
-
-  return { ok, message };
+export async function fetchSummary(): Promise<SummaryGql> {
+  const q = `query { summary { total_hands_played tables_count tournaments_count } }`;
+  // summary likely одинаково в обеих схемах, но держим единообразно
+  return await gqlWithFallback<{ summary: SummaryGql }>(q, q).then((d) => d.summary);
 }
 
-/**
- * Достаёт ack из объекта ответа по нескольким возможным названиям полей.
- */
-function extractAckFromResponse(
-  data: unknown,
-  fieldNames: string[],
-  context: string
-): MutationAck {
-  if (data === null || typeof data !== "object") {
-    console.log(
-      `[pokerApi] ${context}: non-object GraphQL data (treated as ok):`,
-      data
-    );
-    return {
-      ok: true,
-      message: "",
-    };
-  }
+export async function fetchTables(): Promise<GqlTableView[]> {
+  const qSnake = `query { tables {
+    table_id name max_seats small_blind big_blind ante street dealer_button total_pot
+    board { rank suit }
+    players { player_id display_name seat_index stack current_bet status hole_cards { rank suit } }
+    hand_in_progress current_actor_seat
+  } }`;
 
-  const obj = data as Record<string, unknown>;
-
-  for (const field of fieldNames) {
-    if (Object.prototype.hasOwnProperty.call(obj, field)) {
-      return normalizeAck(obj[field], context);
+  const qCamel = `query { tables {
+    tableId: table_id
+    name
+    maxSeats: max_seats
+    smallBlind: small_blind
+    bigBlind: big_blind
+    ante
+    street
+    dealerButton: dealer_button
+    totalPot: total_pot
+    board { rank suit }
+    players {
+      playerId: player_id
+      displayName: display_name
+      seatIndex: seat_index
+      stack
+      currentBet: current_bet
+      status
+      holeCards: hole_cards { rank suit }
     }
-  }
+    handInProgress: hand_in_progress
+    currentActorSeat: current_actor_seat
+  } }`;
 
-  console.log(
-    `[pokerApi] ${context}: ack field not found in data (treated as ok):`,
-    data
+  // Вариант camel использует алиасы, чтобы привести к твоей snake-структуре нельзя.
+  // Поэтому делаем так: если сработал camel запрос — мы должны маппить вручную.
+  // Но проще: используем fallback не на алиасы, а на реальные camel имена полей.
+  // (Ниже второй запрос именно с camelCase полями без алиасов.)
+
+  const qCamelReal = `query { tables {
+    tableId
+    name
+    maxSeats
+    smallBlind
+    bigBlind
+    ante
+    street
+    dealerButton
+    totalPot
+    board { rank suit }
+    players {
+      playerId
+      displayName
+      seatIndex
+      stack
+      currentBet
+      status
+      holeCards { rank suit }
+    }
+    handInProgress
+    currentActorSeat
+  } }`;
+
+  // Пытаемся snake first, потом camel-real
+  const data = await gqlWithFallback<{ tables: GqlTableView[] }>(qSnake, qCamelReal);
+  return data.tables;
+}
+
+export async function fetchTable(tableId: TableId): Promise<GqlTableView | null> {
+  const qSnake = `query($tableId: String!) {
+    table(table_id: $tableId) {
+      table_id name max_seats small_blind big_blind ante street dealer_button total_pot
+      board { rank suit }
+      players { player_id display_name seat_index stack current_bet status hole_cards { rank suit } }
+      hand_in_progress current_actor_seat
+    }
+  }`;
+
+  const qCamel = `query($tableId: String!) {
+    table(tableId: $tableId) {
+      tableId
+      name
+      maxSeats
+      smallBlind
+      bigBlind
+      ante
+      street
+      dealerButton
+      totalPot
+      board { rank suit }
+      players { playerId displayName seatIndex stack currentBet status holeCards { rank suit } }
+      handInProgress
+      currentActorSeat
+    }
+  }`;
+
+  const data = await gqlWithFallback<{ table: GqlTableView | null }>(
+    qSnake,
+    qCamel,
+    { tableId }
   );
-  return {
-    ok: true,
-    message: "",
-  };
+  return data.table;
 }
 
-// ============================================================================
-//           Маппинги GQL <-> твои DTO (snake_case формы)
-// ============================================================================
+export async function fetchTournaments(): Promise<GqlTournamentView[]> {
+  const qSnake = `query { tournaments {
+    tournament_id name status current_level players_registered tables_running
+  } }`;
 
-function mapCard(g: GqlCard): OnChainCard {
-  return { rank: g.rank, suit: g.suit };
+  const qCamel = `query { tournaments {
+    tournamentId
+    name
+    status
+    currentLevel
+    playersRegistered
+    tablesRunning
+  } }`;
+
+  const data = await gqlWithFallback<{ tournaments: GqlTournamentView[] }>(qSnake, qCamel);
+  return data.tournaments;
 }
 
-function mapPlayer(g: GqlPlayerAtTable): OnChainPlayerAtTableDto {
-  return {
-    player_id: g.playerId,
-    display_name: g.displayName,
-    seat_index: g.seatIndex,
-    stack: g.stack,
-    current_bet: g.currentBet,
-    status: g.status,
-    hole_cards: g.holeCards ? g.holeCards.map(mapCard) : null,
-  };
-}
-
-function mapTable(g: GqlTableView): OnChainTableViewDto {
-  return {
-    table_id: g.tableId,
-    name: g.name,
-    max_seats: g.maxSeats,
-    small_blind: g.smallBlind,
-    big_blind: g.bigBlind,
-    ante: g.ante,
-    street: g.street,
-    dealer_button: g.dealerButton ?? null,
-    total_pot: g.totalPot,
-    board: g.board.map(mapCard),
-    players: g.players.map(mapPlayer),
-    hand_in_progress: g.handInProgress,
-    current_actor_seat: g.currentActorSeat ?? null,
-  };
-}
-
-function mapTournament(g: GqlTournamentView): OnChainTournamentViewDto {
-  return {
-    tournament_id: g.tournamentId,
-    name: g.name,
-    status: g.status,
-    current_level: g.currentLevel,
-    players_registered: g.playersRegistered,
-    tables_running: g.tablesRunning,
-  };
-}
-
-function mapSummary(g: GqlSummary): SummaryResponse {
-  return {
-    total_hands_played: g.totalHandsPlayed,
-    tables_count: g.tablesCount,
-    tournaments_count: g.tournamentsCount,
-  };
-}
-
-// ============================================================================
-//                           READ-ONLY ЧАСТЬ
-// ============================================================================
-
-export async function fetchTable(
-  tableId: string
-): Promise<OnChainTableViewDto | null> {
-  const query = `
-    query FetchTable($tableId: String!) {
-      table(tableId: $tableId) {
-        tableId
-        name
-        maxSeats
-        smallBlind
-        bigBlind
-        ante
-        street
-        dealerButton
-        totalPot
-        board { rank suit }
-        players {
-          playerId
-          displayName
-          seatIndex
-          stack
-          currentBet
-          status
-          holeCards { rank suit }
-        }
-        handInProgress
-        currentActorSeat
-      }
+export async function fetchTournament(tournamentId: TournamentId): Promise<GqlTournamentView | null> {
+  const qSnake = `query($id: Int!) {
+    tournament_by_id(tournament_id: $id) {
+      tournament_id name status current_level players_registered tables_running
     }
-  `;
+  }`;
 
-  type Resp = { table: GqlTableView | null };
-
-  const data = await callServiceGraphQL<Resp>(query, { tableId });
-  if (!data.table) return null;
-  return mapTable(data.table);
-}
-
-export async function fetchTables(): Promise<OnChainTableViewDto[]> {
-  const query = `
-    query FetchTables {
-      tables {
-        tableId
-        name
-        maxSeats
-        smallBlind
-        bigBlind
-        ante
-        street
-        dealerButton
-        totalPot
-        board { rank suit }
-        players {
-          playerId
-          displayName
-          seatIndex
-          stack
-          currentBet
-          status
-          holeCards { rank suit }
-        }
-        handInProgress
-        currentActorSeat
-      }
+  const qCamel = `query($id: Int!) {
+    tournamentById(tournamentId: $id) {
+      tournamentId
+      name
+      status
+      currentLevel
+      playersRegistered
+      tablesRunning
     }
-  `;
+  }`;
 
-  type Resp = { tables: GqlTableView[] };
+  const data = await gqlWithFallback<{ tournament_by_id: GqlTournamentView | null; tournamentById?: GqlTournamentView | null }>(
+    qSnake,
+    qCamel,
+    { id: tournamentId }
+  );
 
-  const data = await callServiceGraphQL<Resp>(query);
-  return data.tables.map(mapTable);
+  // В зависимости от того, какой запрос отработал, поле будет разное
+  return (data as { tournament_by_id?: GqlTournamentView | null; tournamentById?: GqlTournamentView | null }).tournament_by_id
+    ?? (data as { tournamentById?: GqlTournamentView | null }).tournamentById
+    ?? null;
 }
 
-export async function fetchTournaments(): Promise<OnChainTournamentViewDto[]> {
-  const query = `
-    query FetchTournaments {
-      tournaments {
-        tournamentId
-        name
-        status
-        currentLevel
-        playersRegistered
-        tablesRunning
-      }
+export async function fetchTournamentTables(tournamentId: TournamentId): Promise<GqlTableView[]> {
+  const qSnake = `query($id: Int!) {
+    tournament_tables(tournament_id: $id) {
+      table_id name max_seats small_blind big_blind ante street dealer_button total_pot
+      board { rank suit }
+      players { player_id display_name seat_index stack current_bet status hole_cards { rank suit } }
+      hand_in_progress current_actor_seat
     }
-  `;
+  }`;
 
-  type Resp = { tournaments: GqlTournamentView[] };
-
-  const data = await callServiceGraphQL<Resp>(query);
-  return data.tournaments.map(mapTournament);
-}
-
-export async function fetchTournament(
-  tournamentId: number
-): Promise<OnChainTournamentViewDto | null> {
-  const query = `
-    query FetchTournament($tournamentId: Int!) {
-      tournamentById(tournamentId: $tournamentId) {
-        tournamentId
-        name
-        status
-        currentLevel
-        playersRegistered
-        tablesRunning
-      }
+  const qCamel = `query($id: Int!) {
+    tournamentTables(tournamentId: $id) {
+      tableId
+      name
+      maxSeats
+      smallBlind
+      bigBlind
+      ante
+      street
+      dealerButton
+      totalPot
+      board { rank suit }
+      players { playerId displayName seatIndex stack currentBet status holeCards { rank suit } }
+      handInProgress
+      currentActorSeat
     }
-  `;
+  }`;
 
-  type Resp = { tournamentById: GqlTournamentView | null };
+  const data = await gqlWithFallback<
+    { tournament_tables: GqlTableView[]; tournamentTables?: GqlTableView[] }
+  >(qSnake, qCamel, { id: tournamentId });
 
-  const data = await callServiceGraphQL<Resp>(query, { tournamentId });
-  if (!data.tournamentById) return null;
-  return mapTournament(data.tournamentById);
+  return (
+    (data as { tournament_tables?: GqlTableView[] }).tournament_tables ??
+    (data as { tournamentTables?: GqlTableView[] }).tournamentTables ??
+    []
+  );
 }
 
-export async function fetchTournamentTables(
-  tournamentId: number
-): Promise<OnChainTableViewDto[]> {
-  const query = `
-    query FetchTournamentTables($tournamentId: Int!) {
-      tournamentTables(tournamentId: $tournamentId) {
-        tableId
-        name
-        maxSeats
-        smallBlind
-        bigBlind
-        ante
-        street
-        dealerButton
-        totalPot
-        board { rank suit }
-        players {
-          playerId
-          displayName
-          seatIndex
-          stack
-          currentBet
-          status
-          holeCards { rank suit }
-        }
-        handInProgress
-        currentActorSeat
-      }
-    }
-  `;
+// -----------------------------------------------------------------------------
+// Mutations
+// -----------------------------------------------------------------------------
 
-  type Resp = { tournamentTables: GqlTableView[] };
-
-  const data = await callServiceGraphQL<Resp>(query, { tournamentId });
-  return data.tournamentTables.map(mapTable);
-}
-
-export async function fetchSummary(): Promise<SummaryResponse> {
-  const query = `
-    query FetchSummary {
-      summary {
-        totalHandsPlayed
-        tablesCount
-        tournamentsCount
-      }
-    }
-  `;
-
-  type Resp = { summary: GqlSummary };
-
-  const data = await callServiceGraphQL<Resp>(query);
-  return mapSummary(data.summary);
-}
-
-// ============================================================================
-//                           МУТАЦИИ (contract commands)
-// ============================================================================
-
-export async function createTable(params: {
-  tableId: string;
+export async function createTable(input: {
+  tableId: TableId;
   name: string;
   maxSeats: number;
   smallBlind: number;
   bigBlind: number;
   ante: number;
-  anteType: GqlAnteType;
+  anteType: AnteType;
 }): Promise<MutationAck> {
-  const query = `
-    mutation CreateTable(
-      $tableId: String!,
-      $name: String!,
-      $maxSeats: Int!,
-      $smallBlind: Int!,
-      $bigBlind: Int!,
-      $ante: Int!,
-      $anteType: GqlAnteType!
-    ) {
-      createTable(
-        tableId: $tableId,
-        name: $name,
-        maxSeats: $maxSeats,
-        smallBlind: $smallBlind,
-        bigBlind: $bigBlind,
-        ante: $ante,
-        anteType: $anteType
-      ) {
-        ok
-        message
-      }
-    }
-  `;
+  const mSnake = `mutation($tableId: String!, $name: String!, $maxSeats: Int!, $sb: Int!, $bb: Int!, $ante: Int!, $anteType: GqlAnteType!) {
+    create_table(
+      table_id: $tableId,
+      name: $name,
+      max_seats: $maxSeats,
+      small_blind: $sb,
+      big_blind: $bb,
+      ante: $ante,
+      ante_type: $anteType
+    ) { ok message }
+  }`;
 
-  type Resp = {
-    createTable?: unknown;
-    create_table?: unknown;
+  const mCamel = `mutation($tableId: String!, $name: String!, $maxSeats: Int!, $sb: Int!, $bb: Int!, $ante: Int!, $anteType: GqlAnteType!) {
+    createTable(
+      tableId: $tableId,
+      name: $name,
+      maxSeats: $maxSeats,
+      smallBlind: $sb,
+      bigBlind: $bb,
+      ante: $ante,
+      anteType: $anteType
+    ) { ok message }
+  }`;
+
+  const vars = {
+    tableId: input.tableId,
+    name: input.name,
+    maxSeats: input.maxSeats,
+    sb: input.smallBlind,
+    bb: input.bigBlind,
+    ante: input.ante,
+    anteType: input.anteType,
   };
 
-  const data = await callServiceGraphQL<Resp>(query, params);
-  return extractAckFromResponse(
-    data,
-    ["createTable", "create_table"],
-    "createTable"
+  const data = await gqlWithFallback<{ create_table: MutationAck; createTable?: MutationAck }>(
+    mSnake,
+    mCamel,
+    vars
+  );
+
+  return (
+    (data as { create_table?: MutationAck }).create_table ??
+    (data as { createTable?: MutationAck }).createTable ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-export async function seatPlayer(params: {
-  tableId: string;
+export async function seatPlayer(input: {
+  tableId: TableId;
   playerId: number;
   seatIndex: number;
   displayName: string;
   initialStack: number;
 }): Promise<MutationAck> {
-  const query = `
-    mutation SeatPlayer(
-      $tableId: String!,
-      $playerId: Int!,
-      $seatIndex: Int!,
-      $displayName: String!,
-      $initialStack: Int!
-    ) {
-      seatPlayer(
-        tableId: $tableId,
-        playerId: $playerId,
-        seatIndex: $seatIndex,
-        displayName: $displayName,
-        initialStack: $initialStack
-      ) {
-        ok
-        message
-      }
-    }
-  `;
+  const mSnake = `mutation($tableId: String!, $playerId: Int!, $seatIndex: Int!, $displayName: String!, $initialStack: Int!) {
+    seat_player(
+      table_id: $tableId,
+      player_id: $playerId,
+      seat_index: $seatIndex,
+      display_name: $displayName,
+      initial_stack: $initialStack
+    ) { ok message }
+  }`;
 
-  type Resp = {
-    seatPlayer?: unknown;
-    seat_player?: unknown;
+  const mCamel = `mutation($tableId: String!, $playerId: Int!, $seatIndex: Int!, $displayName: String!, $initialStack: Int!) {
+    seatPlayer(
+      tableId: $tableId,
+      playerId: $playerId,
+      seatIndex: $seatIndex,
+      displayName: $displayName,
+      initialStack: $initialStack
+    ) { ok message }
+  }`;
+
+  const vars = {
+    tableId: input.tableId,
+    playerId: input.playerId,
+    seatIndex: input.seatIndex,
+    displayName: input.displayName,
+    initialStack: input.initialStack,
   };
 
-  const data = await callServiceGraphQL<Resp>(query, params);
-  return extractAckFromResponse(
-    data,
-    ["seatPlayer", "seat_player"],
-    "seatPlayer"
+  const data = await gqlWithFallback<{ seat_player: MutationAck; seatPlayer?: MutationAck }>(
+    mSnake,
+    mCamel,
+    vars
+  );
+
+  return (
+    (data as { seat_player?: MutationAck }).seat_player ??
+    (data as { seatPlayer?: MutationAck }).seatPlayer ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-export async function unseatPlayer(params: {
-  tableId: string;
-  seatIndex: number;
-}): Promise<MutationAck> {
-  const query = `
-    mutation UnseatPlayer($tableId: String!, $seatIndex: Int!) {
-      unseatPlayer(tableId: $tableId, seatIndex: $seatIndex) {
-        ok
-        message
-      }
-    }
-  `;
+export async function unseatPlayer(tableId: TableId, seatIndex: number): Promise<MutationAck> {
+  const mSnake = `mutation($tableId: String!, $seatIndex: Int!) {
+    unseat_player(table_id: $tableId, seat_index: $seatIndex) { ok message }
+  }`;
 
-  type Resp = {
-    unseatPlayer?: unknown;
-    unseat_player?: unknown;
-  };
+  const mCamel = `mutation($tableId: String!, $seatIndex: Int!) {
+    unseatPlayer(tableId: $tableId, seatIndex: $seatIndex) { ok message }
+  }`;
 
-  const data = await callServiceGraphQL<Resp>(query, params);
-  return extractAckFromResponse(
-    data,
-    ["unseatPlayer", "unseat_player"],
-    "unseatPlayer"
+  const data = await gqlWithFallback<{ unseat_player: MutationAck; unseatPlayer?: MutationAck }>(
+    mSnake,
+    mCamel,
+    { tableId, seatIndex }
+  );
+
+  return (
+    (data as { unseat_player?: MutationAck }).unseat_player ??
+    (data as { unseatPlayer?: MutationAck }).unseatPlayer ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-export async function adjustStack(params: {
-  tableId: string;
-  seatIndex: number;
-  delta: number;
-}): Promise<MutationAck> {
-  const query = `
-    mutation AdjustStack($tableId: String!, $seatIndex: Int!, $delta: Int!) {
-      adjustStack(tableId: $tableId, seatIndex: $seatIndex, delta: $delta) {
-        ok
-        message
-      }
-    }
-  `;
+export async function adjustStack(tableId: TableId, seatIndex: number, delta: number): Promise<MutationAck> {
+  const mSnake = `mutation($tableId: String!, $seatIndex: Int!, $delta: Int!) {
+    adjust_stack(table_id: $tableId, seat_index: $seatIndex, delta: $delta) { ok message }
+  }`;
 
-  type Resp = {
-    adjustStack?: unknown;
-    adjust_stack?: unknown;
-  };
+  const mCamel = `mutation($tableId: String!, $seatIndex: Int!, $delta: Int!) {
+    adjustStack(tableId: $tableId, seatIndex: $seatIndex, delta: $delta) { ok message }
+  }`;
 
-  const data = await callServiceGraphQL<Resp>(query, params);
-  return extractAckFromResponse(
-    data,
-    ["adjustStack", "adjust_stack"],
-    "adjustStack"
+  const data = await gqlWithFallback<{ adjust_stack: MutationAck; adjustStack?: MutationAck }>(
+    mSnake,
+    mCamel,
+    { tableId, seatIndex, delta }
+  );
+
+  return (
+    (data as { adjust_stack?: MutationAck }).adjust_stack ??
+    (data as { adjustStack?: MutationAck }).adjustStack ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-export async function startHand(params: {
-  tableId: string;
-  handId: number;
-}): Promise<MutationAck> {
-  const query = `
-    mutation StartHand($tableId: String!, $handId: Int!) {
-      startHand(tableId: $tableId, handId: $handId) {
-        ok
-        message
-      }
-    }
-  `;
+export async function startHand(tableId: TableId, handId: number): Promise<MutationAck> {
+  const mSnake = `mutation($tableId: String!, $handId: Int!) {
+    start_hand(table_id: $tableId, hand_id: $handId) { ok message }
+  }`;
 
-  type Resp = {
-    startHand?: unknown;
-    start_hand?: unknown;
-  };
+  const mCamel = `mutation($tableId: String!, $handId: Int!) {
+    startHand(tableId: $tableId, handId: $handId) { ok message }
+  }`;
 
-  const data = await callServiceGraphQL<Resp>(query, params);
-  return extractAckFromResponse(
-    data,
-    ["startHand", "start_hand"],
-    "startHand"
+  const data = await gqlWithFallback<{ start_hand: MutationAck; startHand?: MutationAck }>(
+    mSnake,
+    mCamel,
+    { tableId, handId }
+  );
+
+  return (
+    (data as { start_hand?: MutationAck }).start_hand ??
+    (data as { startHand?: MutationAck }).startHand ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-// UI action тип (экспортируем для TablePage)
-export type PlayerActionKindUi =
-  | "fold"
-  | "check"
-  | "call"
-  | "bet"
-  | "raise"
-  | "all_in";
+export async function playerAction(tableId: TableId, action: PlayerActionKind, amount?: number): Promise<MutationAck> {
+  const mSnake = `mutation($tableId: String!, $action: GqlPlayerActionKind!, $amount: Int) {
+    player_action(table_id: $tableId, action: $action, amount: $amount) { ok message }
+  }`;
 
-function mapUiActionToGql(kind: PlayerActionKindUi): GqlPlayerActionKind {
-  switch (kind) {
-    case "fold":
-      return "Fold";
-    case "check":
-      return "Check";
-    case "call":
-      return "Call";
-    case "bet":
-      return "Bet";
-    case "raise":
-      return "Raise";
-    case "all_in":
-      return "AllIn";
-  }
-}
+  const mCamel = `mutation($tableId: String!, $action: GqlPlayerActionKind!, $amount: Int) {
+    playerAction(tableId: $tableId, action: $action, amount: $amount) { ok message }
+  }`;
 
-export async function playerAction(params: {
-  tableId: string;
-  action: PlayerActionKindUi;
-  amount?: number;
-}): Promise<MutationAck> {
-  const query = `
-    mutation PlayerAction(
-      $tableId: String!,
-      $action: GqlPlayerActionKind!,
-      $amount: Int
-    ) {
-      playerAction(tableId: $tableId, action: $action, amount: $amount) {
-        ok
-        message
-      }
-    }
-  `;
+  const vars: Record<string, unknown> = { tableId, action, amount: amount ?? null };
 
-  const variables = {
-    tableId: params.tableId,
-    action: mapUiActionToGql(params.action),
-    amount: params.amount ?? null,
-  };
+  const data = await gqlWithFallback<{ player_action: MutationAck; playerAction?: MutationAck }>(
+    mSnake,
+    mCamel,
+    vars
+  );
 
-  type Resp = {
-    playerAction?: unknown;
-    player_action?: unknown;
-  };
-
-  const data = await callServiceGraphQL<Resp>(query, variables);
-  return extractAckFromResponse(
-    data,
-    ["playerAction", "player_action"],
-    "playerAction"
+  return (
+    (data as { player_action?: MutationAck }).player_action ??
+    (data as { playerAction?: MutationAck }).playerAction ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-export async function tickTable(params: {
-  tableId: string;
-  deltaSecs: number;
-}): Promise<MutationAck> {
-  const query = `
-    mutation TickTable($tableId: String!, $deltaSecs: Int!) {
-      tickTable(tableId: $tableId, deltaSecs: $deltaSecs) {
-        ok
-        message
-      }
-    }
-  `;
+export async function tickTable(tableId: TableId, deltaSecs: number): Promise<MutationAck> {
+  const mSnake = `mutation($tableId: String!, $delta: Int!) {
+    tick_table(table_id: $tableId, delta_secs: $delta) { ok message }
+  }`;
 
-  type Resp = {
-    tickTable?: unknown;
-    tick_table?: unknown;
-  };
+  const mCamel = `mutation($tableId: String!, $delta: Int!) {
+    tickTable(tableId: $tableId, deltaSecs: $delta) { ok message }
+  }`;
 
-  const data = await callServiceGraphQL<Resp>(query, params);
-  return extractAckFromResponse(
-    data,
-    ["tickTable", "tick_table"],
-    "tickTable"
+  const data = await gqlWithFallback<{ tick_table: MutationAck; tickTable?: MutationAck }>(
+    mSnake,
+    mCamel,
+    { tableId, delta: deltaSecs }
+  );
+
+  return (
+    (data as { tick_table?: MutationAck }).tick_table ??
+    (data as { tickTable?: MutationAck }).tickTable ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-// ============================================================================
-//                       ТУРНИРНЫЕ МУТАЦИИ (низкий уровень)
-// ============================================================================
+// JSON scalar in async-graphql обычно называется JSON.
+// config в service.rs: Json<TournamentConfig>
+export type TournamentConfigJson = Record<string, unknown>;
 
-type WireAnteType = "None" | "Classic" | "BigBlind";
+export async function createTournament(tournamentId: TournamentId, config: TournamentConfigJson): Promise<MutationAck> {
+  const mSnake = `mutation($id: Int!, $cfg: JSON!) {
+    create_tournament(tournament_id: $id, config: $cfg) { ok message }
+  }`;
 
-interface WireBlindLevel {
-  level: number;
-  small_blind: number;
-  big_blind: number;
-  ante: number;
-  ante_type: WireAnteType;
-  duration_minutes: number;
-}
+  const mCamel = `mutation($id: Int!, $cfg: JSON!) {
+    createTournament(tournamentId: $id, config: $cfg) { ok message }
+  }`;
 
-interface WireBlindStructure {
-  levels: WireBlindLevel[];
-}
-
-interface WireSchedule {
-  scheduled_start_ts: number;
-  allow_start_earlier: boolean;
-  break_every_minutes: number;
-  break_duration_minutes: number;
-}
-
-interface WireBalancing {
-  enabled: boolean;
-  max_seat_diff: number;
-}
-
-interface WireTournamentConfig {
-  name: string;
-  description: string | null;
-  starting_stack: number;
-  max_players: number;
-  min_players_to_start: number;
-  table_size: number;
-
-  freezeout: boolean;
-  reentry_allowed: boolean;
-  max_entries_per_player: number;
-  late_reg_level: number;
-
-  blind_structure: WireBlindStructure;
-
-  auto_approve: boolean;
-
-  schedule: WireSchedule;
-  balancing: WireBalancing;
-}
-
-function mapAnteTypeToWire(ante: AnteType): WireAnteType {
-  switch (ante) {
-    case "none":
-      return "None";
-    case "ante":
-      return "Classic";
-    case "bba":
-      return "BigBlind";
-  }
-}
-
-function mapUiTournamentConfigToWire(
-  config: TournamentConfig
-): WireTournamentConfig {
-  const cfgWithOptional = config as TournamentConfig & {
-    minPlayersToStart?: number;
-    maxEntriesPerPlayer?: number;
-  };
-
-  const minPlayersToStart =
-    cfgWithOptional.minPlayersToStart ?? config.tableSize ?? 2;
-
-  const freezeout = !config.reEntryAllowed && !config.rebuysAllowed;
-
-  const maxEntriesPerPlayer =
-    cfgWithOptional.maxEntriesPerPlayer ?? (freezeout ? 1 : 3);
-
-  let lateRegLevel = 0;
-  if (config.lateRegMinutes > 0 && config.blindLevelDuration > 0) {
-    const raw = config.lateRegMinutes / config.blindLevelDuration;
-    lateRegLevel = Math.max(1, Math.ceil(raw));
-  }
-
-  const anteTypeWire = mapAnteTypeToWire(config.anteType);
-  const durationPerLevel = config.blindLevelDuration;
-
-  const wireBlindLevels: WireBlindLevel[] = config.blindLevels.map(
-    (lvl: BlindLevel): WireBlindLevel => ({
-      level: lvl.level,
-      small_blind: lvl.smallBlind,
-      big_blind: lvl.bigBlind,
-      ante: lvl.ante,
-      ante_type: anteTypeWire,
-      duration_minutes: durationPerLevel,
-    })
+  const data = await gqlWithFallback<{ create_tournament: MutationAck; createTournament?: MutationAck }>(
+    mSnake,
+    mCamel,
+    { id: tournamentId, cfg: config }
   );
 
-  const blindStructure: WireBlindStructure = {
-    levels: wireBlindLevels,
-  };
-
-  const schedule: WireSchedule = {
-    scheduled_start_ts: 0,
-    allow_start_earlier: true,
-    break_every_minutes: config.breakEveryMinutes || 60,
-    break_duration_minutes: config.breakDurationMinutes || 5,
-  };
-
-  const balancing: WireBalancing = {
-    enabled: true,
-    max_seat_diff: 1,
-  };
-
-  const description =
-    config.description && config.description.trim().length > 0
-      ? config.description
-      : null;
-
-  return {
-    name: config.name,
-    description,
-    starting_stack: config.startingStack,
-    max_players: config.maxPlayers,
-    min_players_to_start: minPlayersToStart,
-    table_size: config.tableSize,
-
-    freezeout,
-    reentry_allowed: config.reEntryAllowed,
-    max_entries_per_player: maxEntriesPerPlayer,
-    late_reg_level: lateRegLevel,
-
-    blind_structure: blindStructure,
-
-    auto_approve: config.instantRegistration,
-
-    schedule,
-    balancing,
-  };
-}
-
-async function createTournamentMutation(params: {
-  tournamentId: number;
-  config: TournamentConfig;
-}): Promise<MutationAck> {
-  const query = `
-    mutation CreateTournament($tournamentId: Int!, $config: Json!) {
-      createTournament(tournamentId: $tournamentId, config: $config) {
-        ok
-        message
-      }
-    }
-  `;
-
-  const wireConfig = mapUiTournamentConfigToWire(params.config);
-
-  type Resp = {
-    createTournament?: unknown;
-    create_tournament?: unknown;
-  };
-
-  const data = await callServiceGraphQL<Resp>(query, {
-    tournamentId: params.tournamentId,
-    config: wireConfig,
-  });
-
-  return extractAckFromResponse(
-    data,
-    ["createTournament", "create_tournament"],
-    "createTournament"
+  return (
+    (data as { create_tournament?: MutationAck }).create_tournament ??
+    (data as { createTournament?: MutationAck }).createTournament ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-async function registerPlayerToTournamentMutation(params: {
-  tournamentId: number;
-  playerId: number;
-  displayName: string;
-}): Promise<MutationAck> {
-  const query = `
-    mutation RegisterPlayerToTournament(
-      $tournamentId: Int!,
-      $playerId: Int!,
-      $displayName: String!
-    ) {
-      registerPlayerToTournament(
-        tournamentId: $tournamentId,
-        playerId: $playerId,
-        displayName: $displayName
-      ) {
-        ok
-        message
-      }
-    }
-  `;
+export async function registerPlayerToTournament(
+  tournamentId: TournamentId,
+  playerId: number,
+  displayName: string
+): Promise<MutationAck> {
+  const mSnake = `mutation($tid: Int!, $pid: Int!, $name: String!) {
+    register_player_to_tournament(tournament_id: $tid, player_id: $pid, display_name: $name) { ok message }
+  }`;
 
-  type Resp = {
-    registerPlayerToTournament?: unknown;
-    register_player_to_tournament?: unknown;
-  };
+  const mCamel = `mutation($tid: Int!, $pid: Int!, $name: String!) {
+    registerPlayerToTournament(tournamentId: $tid, playerId: $pid, displayName: $name) { ok message }
+  }`;
 
-  const data = await callServiceGraphQL<Resp>(query, params);
+  const data = await gqlWithFallback<
+    { register_player_to_tournament: MutationAck; registerPlayerToTournament?: MutationAck }
+  >(mSnake, mCamel, { tid: tournamentId, pid: playerId, name: displayName });
 
-  return extractAckFromResponse(
-    data,
-    ["registerPlayerToTournament", "register_player_to_tournament"],
-    "registerPlayerToTournament"
+  return (
+    (data as { register_player_to_tournament?: MutationAck }).register_player_to_tournament ??
+    (data as { registerPlayerToTournament?: MutationAck }).registerPlayerToTournament ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-async function unregisterPlayerFromTournamentMutation(params: {
-  tournamentId: number;
-  playerId: number;
-}): Promise<MutationAck> {
-  const query = `
-    mutation UnregisterPlayerFromTournament(
-      $tournamentId: Int!,
-      $playerId: Int!
-    ) {
-      unregisterPlayerFromTournament(
-        tournamentId: $tournamentId,
-        playerId: $playerId
-      ) {
-        ok
-        message
-      }
-    }
-  `;
+export async function unregisterPlayerFromTournament(
+  tournamentId: TournamentId,
+  playerId: number
+): Promise<MutationAck> {
+  const mSnake = `mutation($tid: Int!, $pid: Int!) {
+    unregister_player_from_tournament(tournament_id: $tid, player_id: $pid) { ok message }
+  }`;
 
-  type Resp = {
-    unregisterPlayerFromTournament?: unknown;
-    unregister_player_from_tournament?: unknown;
-  };
+  const mCamel = `mutation($tid: Int!, $pid: Int!) {
+    unregisterPlayerFromTournament(tournamentId: $tid, playerId: $pid) { ok message }
+  }`;
 
-  const data = await callServiceGraphQL<Resp>(query, params);
+  const data = await gqlWithFallback<
+    { unregister_player_from_tournament: MutationAck; unregisterPlayerFromTournament?: MutationAck }
+  >(mSnake, mCamel, { tid: tournamentId, pid: playerId });
 
-  return extractAckFromResponse(
-    data,
-    ["unregisterPlayerFromTournament", "unregister_player_from_tournament"],
-    "unregisterPlayerFromTournament"
+  return (
+    (data as { unregister_player_from_tournament?: MutationAck }).unregister_player_from_tournament ??
+    (data as { unregisterPlayerFromTournament?: MutationAck }).unregisterPlayerFromTournament ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-export async function startTournamentMutation(params: {
-  tournamentId: number;
-}): Promise<MutationAck> {
-  const query = `
-    mutation StartTournament($tournamentId: Int!) {
-      startTournament(tournamentId: $tournamentId) {
-        ok
-        message
-      }
-    }
-  `;
+export async function startTournament(tournamentId: TournamentId): Promise<MutationAck> {
+  const mSnake = `mutation($tid: Int!) {
+    start_tournament(tournament_id: $tid) { ok message }
+  }`;
 
-  type Resp = {
-    startTournament?: unknown;
-    start_tournament?: unknown;
-  };
+  const mCamel = `mutation($tid: Int!) {
+    startTournament(tournamentId: $tid) { ok message }
+  }`;
 
-  const data = await callServiceGraphQL<Resp>(query, params);
+  const data = await gqlWithFallback<{ start_tournament: MutationAck; startTournament?: MutationAck }>(
+    mSnake,
+    mCamel,
+    { tid: tournamentId }
+  );
 
-  return extractAckFromResponse(
-    data,
-    ["startTournament", "start_tournament"],
-    "startTournament"
+  return (
+    (data as { start_tournament?: MutationAck }).start_tournament ??
+    (data as { startTournament?: MutationAck }).startTournament ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-export async function advanceTournamentLevelMutation(params: {
-  tournamentId: number;
-}): Promise<MutationAck> {
-  const query = `
-    mutation AdvanceTournamentLevel($tournamentId: Int!) {
-      advanceTournamentLevel(tournamentId: $tournamentId) {
-        ok
-        message
-      }
-    }
-  `;
+export async function advanceTournamentLevel(tournamentId: TournamentId): Promise<MutationAck> {
+  const mSnake = `mutation($tid: Int!) {
+    advance_tournament_level(tournament_id: $tid) { ok message }
+  }`;
 
-  type Resp = {
-    advanceTournamentLevel?: unknown;
-    advance_tournament_level?: unknown;
-  };
+  const mCamel = `mutation($tid: Int!) {
+    advanceTournamentLevel(tournamentId: $tid) { ok message }
+  }`;
 
-  const data = await callServiceGraphQL<Resp>(query, params);
+  const data = await gqlWithFallback<
+    { advance_tournament_level: MutationAck; advanceTournamentLevel?: MutationAck }
+  >(mSnake, mCamel, { tid: tournamentId });
 
-  return extractAckFromResponse(
-    data,
-    ["advanceTournamentLevel", "advance_tournament_level"],
-    "advanceTournamentLevel"
+  return (
+    (data as { advance_tournament_level?: MutationAck }).advance_tournament_level ??
+    (data as { advanceTournamentLevel?: MutationAck }).advanceTournamentLevel ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-export async function closeTournamentMutation(params: {
-  tournamentId: number;
-}): Promise<MutationAck> {
-  const query = `
-    mutation CloseTournament($tournamentId: Int!) {
-      closeTournament(tournamentId: $tournamentId) {
-        ok
-        message
-      }
-    }
-  `;
+export async function closeTournament(tournamentId: TournamentId): Promise<MutationAck> {
+  const mSnake = `mutation($tid: Int!) {
+    close_tournament(tournament_id: $tid) { ok message }
+  }`;
 
-  type Resp = {
-    closeTournament?: unknown;
-    close_tournament?: unknown;
-  };
+  const mCamel = `mutation($tid: Int!) {
+    closeTournament(tournamentId: $tid) { ok message }
+  }`;
 
-  const data = await callServiceGraphQL<Resp>(query, params);
+  const data = await gqlWithFallback<{ close_tournament: MutationAck; closeTournament?: MutationAck }>(
+    mSnake,
+    mCamel,
+    { tid: tournamentId }
+  );
 
-  return extractAckFromResponse(
-    data,
-    ["closeTournament", "close_tournament"],
-    "closeTournament"
+  return (
+    (data as { close_tournament?: MutationAck }).close_tournament ??
+    (data as { closeTournament?: MutationAck }).closeTournament ??
+    { ok: false, message: "Unknown mutation result" }
   );
 }
 
-// ============================================================================
-//                 LEGACY-ОБЁРТКИ (API как раньше для фронта)
-// ============================================================================
+// -----------------------------------------------------------------------------
+// Aliases to match your existing pages’ expectations (so you don’t rewrite imports)
+// -----------------------------------------------------------------------------
 
-export async function createTournament(
-  config: TournamentConfig
-): Promise<OnChainTournamentViewDto> {
-  const tournamentId = Math.floor(Math.random() * 1_000_000_000);
-
-  const ack = await createTournamentMutation({ tournamentId, config });
-  if (!ack.ok) {
-    throw new Error(ack.message || "CreateTournament failed");
-  }
-
-  const view = await fetchTournament(tournamentId);
-  if (!view) {
-    throw new Error("Tournament not found after createTournament");
-  }
-  return view;
-}
-
-export async function registerToTournament(
-  tournamentId: number
-): Promise<OnChainTournamentViewDto> {
-  const ack = await registerPlayerToTournamentMutation({
-    tournamentId,
-    playerId: 1,
-    displayName: "Player #1",
-  });
-
-  if (!ack.ok) {
-    throw new Error(ack.message || "RegisterPlayer failed");
-  }
-
-  const view = await fetchTournament(tournamentId);
-  if (!view) {
-    throw new Error("Tournament not found after registerToTournament");
-  }
-  return view;
-}
-
-export async function unregisterFromTournament(
-  tournamentId: number
-): Promise<OnChainTournamentViewDto> {
-  const ack = await unregisterPlayerFromTournamentMutation({
-    tournamentId,
-    playerId: 1,
-  });
-
-  if (!ack.ok) {
-    throw new Error(ack.message || "UnregisterPlayer failed");
-  }
-
-  const view = await fetchTournament(tournamentId);
-  if (!view) {
-    throw new Error("Tournament not found after unregisterFromTournament");
-  }
-  return view;
-}
-
-export async function startTournament(
-  tournamentId: number
-): Promise<OnChainTournamentViewDto> {
-  const ack = await startTournamentMutation({ tournamentId });
-  if (!ack.ok) {
-    throw new Error(ack.message || "StartTournament failed");
-  }
-
-  const view = await fetchTournament(tournamentId);
-  if (!view) {
-    throw new Error("Tournament not found after startTournament");
-  }
-  return view;
-}
-
-export async function advanceTournamentLevel(
-  tournamentId: number
-): Promise<OnChainTournamentViewDto> {
-  const ack = await advanceTournamentLevelMutation({ tournamentId });
-  if (!ack.ok) {
-    throw new Error(ack.message || "AdvanceTournamentLevel failed");
-  }
-
-  const view = await fetchTournament(tournamentId);
-  if (!view) {
-    throw new Error("Tournament not found after advanceTournamentLevel");
-  }
-  return view;
-}
-
-export async function closeTournament(
-  tournamentId: number
-): Promise<OnChainTournamentViewDto> {
-  const ack = await closeTournamentMutation({ tournamentId });
-  if (!ack.ok) {
-    throw new Error(ack.message || "CloseTournament failed");
-  }
-
-  const view = await fetchTournament(tournamentId);
-  if (!view) {
-    throw new Error("Tournament not found after closeTournament");
-  }
-  return view;
-}
-
-export async function sendPlayerAction(
-  tableId: string,
-  action: PlayerActionKindUi,
-  amount?: number
-): Promise<OnChainTableViewDto | null> {
-  const ack = await playerAction({ tableId, action, amount });
-  if (!ack.ok) {
-    throw new Error(ack.message || "PlayerAction failed");
-  }
-
-  return fetchTable(tableId);
-}
+export const sendPlayerAction = playerAction;
+export const registerToTournament = registerPlayerToTournament;
+export const unregisterFromTournament = unregisterPlayerFromTournament;

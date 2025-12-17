@@ -4,26 +4,22 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
-
-  // Критично для работы wasm + web workers в браузере
   server: {
     headers: {
       "Cross-Origin-Opener-Policy": "same-origin",
-      "Cross-Origin-Embedder-Policy": "require-corp"
-    }
+      "Cross-Origin-Embedder-Policy": "require-corp",
+    },
   },
-
-  // Не позволяем Vite "оптимизировать" @linera/client,
-  // иначе ломается wasm и Conway не поднимается.
-  optimizeDeps: {
-    exclude: ["@linera/client"]
-  },
-
   build: {
     rollupOptions: {
-      // Нужно для корректной сборки wasm-модуля и воркеров
+      input: {
+        index: "index.html",
+        linera: "@linera/client",
+      },
       preserveEntrySignatures: "strict",
-      input: "index.html"
-    }
-  }
+    },
+  },
+  optimizeDeps: {
+    exclude: ["@linera/client"],
+  },
 });

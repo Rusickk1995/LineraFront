@@ -9,7 +9,7 @@ import {
   PayoutType,
   TournamentConfig,
 } from "../types/poker";
-import { createTournament } from "../linera/lineraClient";
+import { createTournament } from "../linera/pokerApi";
 import type { OnChainTournamentViewDto } from "../types/onchain";
 
 const CreateTournamentPage: React.FC = () => {
