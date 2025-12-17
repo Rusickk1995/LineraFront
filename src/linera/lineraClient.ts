@@ -1,3 +1,4 @@
+// src/linera/lineraClient.ts
 import * as linera from "@linera/client";
 
 const FAUCET_URL =
@@ -6,83 +7,132 @@ const FAUCET_URL =
 
 const APP_ID = import.meta.env.VITE_LINERA_APP_ID as string | undefined;
 
-export type Backend = { query(request: string): Promise<string> };
+export type Backend = {
+  query(request: string): Promise<string>;
+};
+
+type GraphQLError = { message: string };
+type GraphQLResponse<TData> = { data?: TData; errors?: GraphQLError[] };
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
 }
 
+function parseJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error("Backend returned invalid JSON");
+  }
+}
+
+/** --- 0) wasm init (в 0.15.7 нет default(), есть initialize()) --- */
 let wasmInitPromise: Promise<void> | null = null;
+
 async function ensureLineraWasm(): Promise<void> {
   if (!wasmInitPromise) {
     wasmInitPromise = (async () => {
-      const anyLinera = linera as any;
-      if (typeof anyLinera.initialize === "function") return anyLinera.initialize();
-      if (typeof anyLinera.main === "function") return anyLinera.main();
-      if (typeof anyLinera.initSync === "function") return anyLinera.initSync();
-      throw new Error("@linera/client: no WASM init entrypoint (initialize/main/initSync).");
+      const anyLinera = linera as unknown as Record<string, unknown>;
+
+      const init = anyLinera["initialize"];
+      const def = anyLinera["default"];
+
+      if (typeof init === "function") {
+        await (init as () => Promise<void>)();
+        return;
+      }
+
+      // на всякий случай (в твоём runtime default=undefined)
+      if (typeof def === "function") {
+        await (def as () => Promise<void>)();
+        return;
+      }
+
+      throw new Error(
+        "Linera WASM init entrypoint not found. Expected initialize() (0.15.7)."
+      );
     })();
   }
-  return wasmInitPromise;
+  await wasmInitPromise;
 }
 
-async function resolveOwner(wallet: linera.Wallet): Promise<string> {
-  // Детерминированно: проверяем, какие методы реально есть, и используем первый валидный.
-  const w: any = wallet;
-  const candidates = ["defaultOwner", "getDefaultOwner", "owner", "getOwner"];
+/** --- 1) Owner: берём из signer (а не из wallet) --- */
+async function resolveOwnerFromSigner(signer: unknown): Promise<string> {
+  const s = signer as Record<string, unknown>;
+  const candidates = ["address", "owner", "publicKey"];
 
   for (const name of candidates) {
-    const fn = w?.[name];
+    const fn = s[name];
     if (typeof fn === "function") {
-      const res = await fn.call(w);
-      if (typeof res === "string" && res.length > 0) return res;
+      const out = await (fn as () => Promise<unknown> | unknown)();
+      if (typeof out === "string" && out.length > 0) return out;
     }
   }
 
-  // Если не нашли — это не “гадание”, это стоп с понятным действием:
-  // надо один раз посмотреть методы Wallet и выбрать правильный.
+  // это не “угадывание”, это стоп с конкретным диагнозом
   throw new Error(
-    "Cannot resolve wallet owner string. Wallet has no known owner getter. " +
-      "Run: node -e \"import('@linera/client').then(({Wallet})=>console.log(Object.getOwnPropertyNames(Wallet.prototype))).catch(console.error)\""
+    "Cannot resolve owner string from PrivateKeySigner. " +
+      "Run: node -e \"import('@linera/client').then(({PrivateKeySigner})=>console.log(Object.getOwnPropertyNames(PrivateKeySigner.prototype)))\""
   );
 }
 
-let clientPromise: Promise<linera.Client> | null = null;
+type Session = {
+  faucet: linera.Faucet;
+  wallet: linera.Wallet;
+  signer: linera.PrivateKeySigner;
+  owner: string;
+  chainId: string;
+  client: linera.Client;
+};
+
+let sessionPromise: Promise<Session> | null = null;
 let backendPromise: Promise<Backend> | null = null;
 
-async function getClient(): Promise<linera.Client> {
-  if (!clientPromise) {
-    clientPromise = (async () => {
+/** --- 2) Client: создаём wallet + signer + claimChain(wallet, owner) --- */
+async function getSession(): Promise<Session> {
+  if (!sessionPromise) {
+    sessionPromise = (async () => {
       await ensureLineraWasm();
 
       const faucet = new linera.Faucet(FAUCET_URL);
       const wallet = await faucet.createWallet();
 
-      const owner = await resolveOwner(wallet);
+      // В 0.15.7 это экспортируется (ты видел в Object.keys)
+      const signer = new linera.PrivateKeySigner();
+      const owner = await resolveOwnerFromSigner(signer);
+
+      // В runtime 0.15.7 claimChain(wallet, owner) — ты это подтвердил Node выводом
       const chainId = await faucet.claimChain(wallet, owner);
+
+      const client = new linera.Client(wallet, signer);
 
       console.info("[Linera] owner:", owner);
       console.info("[Linera] chain:", chainId);
 
-      return new linera.Client(wallet);
+      return { faucet, wallet, signer, owner, chainId, client };
     })();
   }
-  return clientPromise;
+  return sessionPromise;
+}
+
+export async function getClient(): Promise<linera.Client> {
+  const s = await getSession();
+  return s.client;
 }
 
 export async function getBackend(): Promise<Backend> {
   if (!backendPromise) {
     backendPromise = (async () => {
-      if (!APP_ID) throw new Error("VITE_LINERA_APP_ID is missing.");
+      if (!APP_ID) throw new Error("VITE_LINERA_APP_ID is missing (.env / Vercel env).");
 
       const client = await getClient();
       const app = await client.frontend().application(APP_ID);
 
-      if (!isRecord(app) || typeof (app as any).query !== "function") {
-        throw new Error("Application does not expose query(request: string): Promise<string>");
+      const maybe = app as unknown;
+      if (!isRecord(maybe) || typeof (maybe as { query?: unknown }).query !== "function") {
+        throw new Error("Backend does not expose query(request: string): Promise<string>");
       }
-
-      return { query: (req: string) => (app as any).query(req) };
+      return maybe as Backend;
     })();
   }
   return backendPromise;
@@ -95,17 +145,29 @@ export async function gql<TData>(
 ): Promise<TData> {
   const backend = await getBackend();
   const request = JSON.stringify({ query, variables, operationName });
-  const raw = await backend.query(request);
 
-  const parsed = JSON.parse(raw) as any;
-  if (parsed?.errors?.length) {
-    throw new Error(parsed.errors.map((e: any) => e?.message ?? "Unknown error").join("; "));
+  const raw = await backend.query(request);
+  const parsed = parseJson(raw);
+
+  if (!isRecord(parsed)) throw new Error("Unexpected GraphQL response shape");
+
+  const errors = parsed.errors;
+  if (Array.isArray(errors) && errors.length > 0) {
+    const msg = errors
+      .map((e) => (isRecord(e) && typeof e.message === "string" ? e.message : "Unknown error"))
+      .join("; ");
+    throw new Error(msg);
   }
-  if (parsed?.data === undefined) throw new Error("GraphQL response has no data");
-  return parsed.data as TData;
+
+  const data = (parsed as GraphQLResponse<TData>).data;
+  if (data === undefined) throw new Error("GraphQL response has no data");
+  return data;
 }
 
-export async function listGraphQLOperations(): Promise<{ queries: string[]; mutations: string[] }> {
+export async function listGraphQLOperations(): Promise<{
+  queries: string[];
+  mutations: string[];
+}> {
   const q = `
     query {
       __schema {
@@ -114,11 +176,32 @@ export async function listGraphQLOperations(): Promise<{ queries: string[]; muta
       }
     }
   `;
-  const data = await gql<any>(q);
+
+  const data = await gql<{
+    __schema: {
+      queryType: { fields: { name: string }[] } | null;
+      mutationType: { fields: { name: string }[] } | null;
+    };
+  }>(q);
+
   return {
-    queries: (data.__schema?.queryType?.fields ?? []).map((f: any) => f.name),
-    mutations: (data.__schema?.mutationType?.fields ?? []).map((f: any) => f.name),
+    queries: (data.__schema.queryType?.fields ?? []).map((f) => f.name),
+    mutations: (data.__schema.mutationType?.fields ?? []).map((f) => f.name),
   };
 }
 
+/** --- 3) Debug: чтобы ты тестировал в браузере, а не в bash --- */
+declare global {
+  interface Window {
+    lineraDebug?: {
+      getClient: typeof getClient;
+      getBackend: typeof getBackend;
+      gql: typeof gql;
+      listGraphQLOperations: typeof listGraphQLOperations;
+    };
+  }
+}
+window.lineraDebug = { getClient, getBackend, gql, listGraphQLOperations };
+
+/** ВАЖНО: это лечит твою ошибку build: страницы импортируют fetchTournaments из lineraClient.ts */
 export * from "./pokerApi";
