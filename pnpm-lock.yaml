@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@linera/client':
-        specifier: 0.15.7
-        version: 0.15.7
+        specifier: 0.15.8
+        version: 0.15.8
       lucide-react:
         specifier: ^0.344.0
         version: 0.344.0(react@18.3.1)
@@ -367,8 +367,8 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
-  '@linera/client@0.15.7':
-    resolution: {integrity: sha512-W2zbV/wuPxEnVIlheQhrdA6wiHQNxytHcn4ndQH/BUKXw8vNidH9wugypZTK8yNZUvL6rqef87F7hH548R0RUg==}
+  '@linera/client@0.15.8':
+    resolution: {integrity: sha512-Pg42vWsu6A8Ky3XqqglC+qX1kaHaGnMCF0R5MW/xofd5Saetx4akUvVA49oz8SmopIr7EvNnr5o3d9meZnTAnw==}
 
   '@noble/curves@1.2.0':
     resolution: {integrity: sha512-oYclrNgRaM9SsBUBVbb8M6DTV7ZHRTKugureoYEncY5c65HOmRzvSiTE3y5CYaPYJA/GVkrhXEoF0M3Ya9PMnw==}
@@ -1628,7 +1628,7 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@linera/client@0.15.7':
+  '@linera/client@0.15.8':
     dependencies:
       ethers: 6.16.0
     transitivePeerDependencies:
