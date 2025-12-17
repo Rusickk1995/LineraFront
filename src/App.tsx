@@ -10,6 +10,8 @@ import TournamentPage from "./pages/TournamentPage";
 import TablePage from "./pages/TablePage";
 
 import { getBackend } from "./linera/lineraClient";
+import { fetchSummary, fetchTournaments } from "./linera/pokerApi";
+
 
 const App: React.FC = () => {
   useEffect(() => {
@@ -18,6 +20,22 @@ const App: React.FC = () => {
       console.error("[App] Failed to init Linera backend:", e);
     });
   }, []);
+
+  useEffect(() => {
+  getBackend()
+    .then(async () => {
+      console.log("[TEST] Linera backend ready");
+
+      const s = await fetchSummary();
+      console.log("[TEST] summary:", s);
+
+      const t = await fetchTournaments();
+      console.log("[TEST] tournaments:", t);
+    })
+    .catch((e) => {
+      console.error("[TEST] init failed:", e);
+    });
+}, []);
 
   return (
     <Routes>
